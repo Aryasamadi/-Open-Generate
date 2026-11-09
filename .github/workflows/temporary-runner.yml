@@ -1,0 +1,245 @@
+name: Open-Generate temporary GitHub Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      admin_id:
+        description: "Telegram numeric Admin ID"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: open-generate-temporary-runner
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      SUPER_ADMIN_IDS: ${{ inputs.admin_id }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GITHUB_SERVER_URL: ${{ github.server_url }}
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs and derive stable encryption key
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+            echo "::error::Add TELEGRAM_BOT_TOKEN under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [[ ! "${SUPER_ADMIN_IDS}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            echo "::error::Admin ID must be numeric (multiple IDs may be comma-separated)."
+            exit 1
+          fi
+          KEY="$(python3 - <<'PY'
+          import hashlib, hmac, os
+          token = os.environ["TELEGRAM_BOT_TOKEN"].encode()
+          context = ("open-generate-encryption-v1:" + os.environ["GITHUB_REPOSITORY"]).encode()
+          print(hmac.new(token, context, hashlib.sha256).hexdigest())
+          PY
+          )"
+          echo "::add-mask::$KEY"
+          printf 'ENCRYPTION_KEY=%s\n' "$KEY" >> "$GITHUB_ENV"
+          echo "Inputs validated; stable encryption key prepared."
+
+      - name: Create runner-only environment and state helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          DB_PASSWORD="$(openssl rand -hex 32)"
+          umask 077
+          cat > .env.secret <<EOF
+          APP_ENV=production
+          LOG_LEVEL=INFO
+          LOG_FORMAT=console
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          BOT_MODE=polling
+          SUPER_ADMIN_IDS=${SUPER_ADMIN_IDS}
+          DB_DRIVER=postgresql+asyncpg
+          DB_HOST=db
+          DB_PORT=5432
+          DB_NAME=opengenerate
+          DB_USER=og_user
+          DB_PASSWORD=${DB_PASSWORD}
+          ENCRYPTION_KEY=${ENCRYPTION_KEY}
+          HEALTH_PORT=9090
+          METRICS_PORT=9091
+          EOF
+          chmod 600 .env.secret
+
+          STATE_DIR="$RUNNER_TEMP/open-generate-state"
+          mkdir -p "$STATE_DIR"
+          git init -q -b open-generate-runtime-state "$STATE_DIR"
+          git -C "$STATE_DIR" config user.name "github-actions[bot]"
+          git -C "$STATE_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$STATE_DIR" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          if git -C "$STATE_DIR" -c "http.https://github.com/.extraheader=$AUTH_HEADER" fetch --depth=1 origin "refs/heads/open-generate-runtime-state:refs/remotes/origin/open-generate-runtime-state" 2>/dev/null; then
+            git -C "$STATE_DIR" checkout -q -B open-generate-runtime-state refs/remotes/origin/open-generate-runtime-state
+            echo "Previous encrypted database snapshot found."
+          else
+            echo "No previous snapshot; a new database will be initialized."
+          fi
+          printf 'STATE_DIR=%s\n' "$STATE_DIR" >> "$GITHUB_ENV"
+
+          cat > "$RUNNER_TEMP/open-generate-state.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          STATE_DIR="${STATE_DIR:?}"
+          STATE_BRANCH="open-generate-runtime-state"
+          COMPOSE=(docker compose --env-file "$GITHUB_WORKSPACE/.env.secret" -f "$GITHUB_WORKSPACE/docker-compose.yml" -p open-generate-runner)
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          ENCRYPTED="$STATE_DIR/database.dump.enc"
+          MAC="$STATE_DIR/database.dump.enc.hmac"
+
+          verify_snapshot() {
+            python3 - "$ENCRYPTED" "$MAC" <<'PY'
+          import hashlib, hmac, os, pathlib, sys
+          encrypted = pathlib.Path(sys.argv[1]).read_bytes()
+          expected = pathlib.Path(sys.argv[2]).read_text().strip()
+          key = bytes.fromhex(os.environ["ENCRYPTION_KEY"])
+          actual = hmac.new(key, encrypted, hashlib.sha256).hexdigest()
+          if not hmac.compare_digest(actual, expected):
+              raise SystemExit("Database snapshot authentication failed; refusing restore.")
+          PY
+          }
+
+          case "${1:-save}" in
+            restore)
+              if [[ ! -f "$ENCRYPTED" && ! -f "$MAC" ]]; then
+                echo "No saved database to restore."
+                exit 0
+              fi
+              if [[ ! -f "$ENCRYPTED" || ! -f "$MAC" ]]; then
+                echo "Incomplete database snapshot; refusing restore." >&2
+                exit 1
+              fi
+              verify_snapshot
+              openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+                -pass env:ENCRYPTION_KEY -in "$ENCRYPTED" -out "$RUNNER_TEMP/database.dump.gz"
+              gunzip -t "$RUNNER_TEMP/database.dump.gz"
+              gunzip -c "$RUNNER_TEMP/database.dump.gz" | "${COMPOSE[@]}" exec -T db \
+                psql -v ON_ERROR_STOP=1 -U og_user -d opengenerate
+              echo "Previous database restored successfully."
+              ;;
+            save)
+              mkdir -p "$STATE_DIR"
+              "${COMPOSE[@]}" exec -T db pg_dump --no-owner --no-acl -U og_user -d opengenerate \
+                | gzip -c > "$RUNNER_TEMP/database.dump.gz"
+              openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+                -pass env:ENCRYPTION_KEY -in "$RUNNER_TEMP/database.dump.gz" -out "$ENCRYPTED"
+              python3 - "$ENCRYPTED" "$MAC" <<'PY'
+          import hashlib, hmac, os, pathlib, sys
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          key = bytes.fromhex(os.environ["ENCRYPTION_KEY"])
+          pathlib.Path(sys.argv[2]).write_text(hmac.new(key, data, hashlib.sha256).hexdigest() + "\n")
+          PY
+              git -C "$STATE_DIR" add database.dump.enc database.dump.enc.hmac
+              if ! git -C "$STATE_DIR" diff --cached --quiet; then
+                if git -C "$STATE_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+                  git -C "$STATE_DIR" commit --amend -m "Update encrypted Open-Generate runner database"
+                else
+                  git -C "$STATE_DIR" commit -m "Initialize encrypted Open-Generate runner database"
+                fi
+                git -C "$STATE_DIR" -c "http.https://github.com/.extraheader=$AUTH_HEADER" \
+                  push --force origin "HEAD:refs/heads/$STATE_BRANCH"
+                echo "Encrypted database snapshot saved to private branch."
+              else
+                echo "Database snapshot unchanged."
+              fi
+              ;;
+            *)
+              echo "Usage: $0 {restore|save}" >&2
+              exit 2
+              ;;
+          esac
+          SCRIPT
+          chmod 700 "$RUNNER_TEMP/open-generate-state.sh"
+
+      - name: Build containers and start PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner build bot worker migrate
+          docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner up -d db
+          for attempt in $(seq 1 60); do
+            if docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner exec -T db pg_isready -U og_user -d opengenerate >/dev/null 2>&1; then
+              echo "PostgreSQL is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::PostgreSQL did not become ready."
+          docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner logs db
+          exit 1
+
+      - name: Restore persistent database when available
+        shell: bash
+        run: bash "$RUNNER_TEMP/open-generate-state.sh" restore
+
+      - name: Run migrations and start bot plus worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner run --rm migrate
+          docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner up -d bot worker
+          for attempt in $(seq 1 36); do
+            if curl -fsS http://127.0.0.1:9090/health | grep -q '"status": "ok"'; then
+              echo "Bot and scheduler health check passed."
+              bash "$RUNNER_TEMP/open-generate-state.sh" save
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Application health check did not pass."
+          docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner logs --tail=120 bot worker db
+          exit 1
+
+      - name: Keep temporary runner alive and checkpoint database
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPOSE=(docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner)
+          echo "Runner test started. Database snapshots are pushed every 2 minutes."
+          for cycle in $(seq 1 160); do
+            sleep 120
+            RUNNING="$("${COMPOSE[@]}" ps --services --status running)"
+            for service in bot worker db; do
+              if ! grep -Fxq "$service" <<< "$RUNNING"; then
+                echo "::error::Service $service is not running."
+                "${COMPOSE[@]}" logs --tail=150 "$service"
+                exit 1
+              fi
+            done
+            bash "$RUNNER_TEMP/open-generate-state.sh" save
+            if (( cycle % 5 == 0 )); then
+              curl -fsS http://127.0.0.1:9090/health || true
+            fi
+          done
+          echo "Temporary runner session reached its planned 320-minute limit."
+
+      - name: Save final database snapshot and clean up runner containers
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f .env.secret ]] && docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner ps -q db | grep -q .; then
+            bash "$RUNNER_TEMP/open-generate-state.sh" save
+            docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner down --remove-orphans || true
+          else
+            echo "Database container was not initialized; no final snapshot required."
+          fi
