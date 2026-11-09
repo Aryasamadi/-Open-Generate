@@ -2,11 +2,6 @@ name: Open-Generate temporary GitHub Runner
 
 on:
   workflow_dispatch:
-    inputs:
-      admin_id:
-        description: "Telegram numeric Admin ID"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -18,11 +13,11 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      SUPER_ADMIN_IDS: ${{ inputs.admin_id }}
+      SUPER_ADMIN_IDS: ${{ secrets.TELEGRAM_ADMIN_ID }}
       GITHUB_TOKEN: ${{ github.token }}
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_SERVER_URL: ${{ github.server_url }}
@@ -41,8 +36,12 @@ jobs:
             echo "::error::Add TELEGRAM_BOT_TOKEN under Settings > Secrets and variables > Actions."
             exit 1
           fi
+          if [[ -z "${SUPER_ADMIN_IDS:-}" ]]; then
+            echo "::error::Add TELEGRAM_ADMIN_ID under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
           if [[ ! "${SUPER_ADMIN_IDS}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
-            echo "::error::Admin ID must be numeric (multiple IDs may be comma-separated)."
+            echo "::error::TELEGRAM_ADMIN_ID must contain numeric Telegram ID(s), comma-separated if multiple."
             exit 1
           fi
           # Keep the Telegram token stable: it also anchors the persistent database encryption key.
@@ -56,6 +55,11 @@ jobs:
           echo "::add-mask::$KEY"
           printf 'ENCRYPTION_KEY=%s\n' "$KEY" >> "$GITHUB_ENV"
           echo "Inputs validated; stable encryption key prepared."
+
+      - name: Record job start time
+        shell: bash
+        run: |
+          printf 'JOB_START_EPOCH=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Create runner-only environment and state helper
         shell: bash
@@ -215,8 +219,10 @@ jobs:
         run: |
           set -euo pipefail
           COMPOSE=(docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner)
-          echo "Runner test started. Database snapshots are pushed every 2 minutes."
-          for cycle in $(seq 1 160); do
+          JOB_DEADLINE=$((JOB_START_EPOCH + 355 * 60 - 300))
+          CYCLE=0
+          echo "Runner test is configured for a 355-minute job. Database snapshots are pushed every 2 minutes."
+          while (( $(date +%s) < JOB_DEADLINE )); do
             sleep 120
             RUNNING="$("${COMPOSE[@]}" ps --services --status running)"
             for service in bot worker db; do
@@ -227,11 +233,12 @@ jobs:
               fi
             done
             bash "$RUNNER_TEMP/open-generate-state.sh" save
-            if (( cycle % 5 == 0 )); then
+            CYCLE=$((CYCLE + 1))
+            if (( CYCLE % 5 == 0 )); then
               curl -fsS http://127.0.0.1:9090/health || true
             fi
           done
-          echo "Temporary runner session reached its planned 320-minute limit."
+          echo "Runner session reached the final-save window before the 355-minute job limit."
 
       - name: Save final database snapshot and clean up runner containers
         if: always()
