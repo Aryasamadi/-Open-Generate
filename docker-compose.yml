@@ -1,0 +1,117 @@
+version: "3.9"
+
+# ------------------------------------------------------------------ Networks
+networks:
+  internal:
+    driver: bridge
+    internal: true      # DB روی اینترنت expose نمی‌شود
+  external:
+    driver: bridge
+
+# ------------------------------------------------------------------ Volumes
+volumes:
+  pg_data:
+    driver: local
+  og_data:
+    driver: local
+
+# ------------------------------------------------------------------ Services
+services:
+
+  # -------------------- PostgreSQL
+  # مشکل قبلی: ${DB_NAME} و ${DB_PASSWORD} در service db از env host
+  # خوانده می‌شدند (یا .env پیش‌فرض docker compose)، نه از .env.secret.
+  # راه‌حل صحیح: service db هم env_file را load می‌کند.
+  # Docker Compose تضمین می‌کند environment روی env_file override می‌کند،
+  # اما POSTGRES_PASSWORD به env_file نیاز دارد تا در اولین اجرا درست باشد.
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [internal]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    env_file: [.env.secret]
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-opengenerate}
+      POSTGRES_USER:     ${DB_USER:-og_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env.secret}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-og_user} -d ${DB_NAME:-opengenerate}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------- Migrate (run once then exit)
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.runtime.migrate"]
+    networks: [internal]
+    volumes:
+      - og_data:/data
+    env_file: [.env.secret]
+    environment:
+      DB_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # -------------------- Bot
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.runtime.bot"]
+    restart: unless-stopped
+    networks: [internal, external]
+    volumes:
+      - og_data:/data
+    env_file: [.env.secret]
+    environment:
+      DB_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # پورت health فقط روی 127.0.0.1 — نه روی اینترنت
+    # health.py وضعیت scheduler (worker) را هم گزارش می‌دهد
+    ports:
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # -------------------- Worker (Scheduler + Publish + Notification)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.runtime.worker"]
+    restart: unless-stopped
+    networks: [internal, external]
+    volumes:
+      - og_data:/data
+    env_file: [.env.secret]
+    environment:
+      DB_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G

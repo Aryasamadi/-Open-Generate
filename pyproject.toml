@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open-generate"
+version = "1.0.0"
+description = "سامانه چندکاربره مدیریت کانال تلگرام و انتشار خودکار محتوای خبری با هوش مصنوعی"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    # Telegram
+    "python-telegram-bot[job-queue]==21.6",
+
+    # Database
+    "sqlalchemy[asyncio]==2.0.36",
+    "alembic==1.14.0",
+    "asyncpg==0.30.0",          # PostgreSQL async driver (runtime)
+    "psycopg2-binary==2.9.10",  # PostgreSQL sync driver — Alembic به sync driver نیاز دارد
+    "aiosqlite==0.20.0",        # SQLite async driver (dev/small deployments)
+
+    # HTTP / Feed
+    "httpx[http2]==0.27.2",
+    "feedparser==6.0.11",
+    "beautifulsoup4==4.12.3",
+    "lxml==5.3.0",
+    "charset-normalizer==3.4.0",
+
+    # AI Providers
+    "anthropic==0.40.0",
+    "google-generativeai==0.8.3",
+    "openai==1.57.0",           # OpenAI-compatible clients
+
+    # Validation & Config
+    "pydantic==2.10.3",
+    "pydantic-settings==2.6.1",
+
+    # Cryptography
+    "cryptography==43.0.3",
+
+    # Scheduling
+    "apscheduler==3.10.4",
+
+    # Utilities
+    "python-dateutil==2.9.0",
+    "pytz==2024.2",
+    "tzdata==2024.2",
+    "structlog==24.4.0",
+    "prometheus-client==0.21.1",
+    "tenacity==9.0.0",
+    "limits==3.14.0",
+    "anyio==4.7.0",
+
+    # Image validation (receipts)
+    "pillow==11.0.0",
+    "python-magic==0.4.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "pytest-mock==3.14.0",
+    "respx==0.21.1",
+    "factory-boy==3.3.1",
+    "mypy==1.13.0",
+    "ruff==0.8.3",
+    "pre-commit==4.0.1",
+    "bandit==1.8.0",
+    "pip-audit==2.7.3",
+    "types-python-dateutil",
+    "types-pytz",
+]
+
+[project.scripts]
+# نکته: پکیج نصب‌شده "src" است (نگاه کنید به [tool.hatch.build.targets.wheel]
+# پایین‌تر)، نه "open_generate" — این ۶ خط قبلاً به ماژولی اشاره می‌کردند که
+# اصلاً وجود نداشت و هیچ‌کدام از این دستورات کار نمی‌کردند.
+og-bot      = "src.runtime.bot:main"
+og-worker   = "src.runtime.worker:main"
+og-migrate  = "src.runtime.migrate:main"
+og-backup   = "src.runtime.backup:main"
+og-restore  = "src.runtime.restore:main"
+og-health   = "src.runtime.health:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "W", "F", "I", "B", "C4", "UP", "S", "ANN"]
+ignore = ["ANN101", "ANN102"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=src --cov-report=term-missing --cov-fail-under=70"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/migrations/*", "*/tests/*"]
