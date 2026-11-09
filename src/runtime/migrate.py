@@ -121,6 +121,25 @@ def _run_alembic(ini_path: Path) -> bool:
         return False
 
 
+
+async def _run_async_phase(*, fallback: bool) -> None:
+    """
+    اجرای تمام عملیات async دیتابیس در یک Event Loop واحد.
+    اگر Alembic شکست بخورد، create_all و seed نباید با asyncio.runهای جدا
+    اجرا شوند؛ asyncpg connection pool به loop قبلی وابسته می‌ماند.
+    """
+    from src.infrastructure.db.session import close_engine
+
+    try:
+        if fallback:
+            print("🔄 Fallback: create_all...")
+            await _create_all_and_stamp()
+        print("🌱 Seed داده‌های اولیه...")
+        await run_seed()
+    finally:
+        await close_engine()
+
+
 def main() -> None:
     from src.infrastructure.logging.logger import setup_logging, get_logger
     setup_logging()
@@ -139,17 +158,9 @@ def main() -> None:
     else:
         print(f"  ⚠️  alembic.ini یافت نشد: {ini_path}")
 
-    if not alembic_ok:
-        # ۲) Fallback: create_all
-        # این مسیر برای SQLite (dev) و برای اولین راه‌اندازی بدون psycopg2 مناسب است.
-        # پس از create_all، alembic_version را مستقیماً ثبت می‌کنیم تا
-        # migrationهای آینده بدون مشکل upgrade کنند.
-        print("🔄 Fallback: create_all...")
-        asyncio.run(_create_all_and_stamp())
-
-    # ۳) Seed
-    print("🌱 Seed داده‌های اولیه...")
-    asyncio.run(run_seed())
+    # تمام عملیات async دیتابیس (از جمله fallback و seed) در یک loop اجرا می‌شوند.
+    # Alembic در مسیر موفق sync است و پیش از شروع این loop اجرا شده است.
+    asyncio.run(_run_async_phase(fallback=not alembic_ok))
 
     log.info("migration_done", via="alembic" if alembic_ok else "create_all_fallback")
     print("✅ Migration & Seed کامل.")
