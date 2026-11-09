@@ -154,7 +154,7 @@ def upgrade() -> None:
     op.create_unique_constraint("uq_article_channel_url", "articles", ["channel_id", "url_hash"])
 
     for tbl_def in _remaining_tables():
-        op.create_table(*tbl_def[0], *tbl_def[1])
+        op.create_table(tbl_def[0], *tbl_def[1])
         for idx in tbl_def[2]:
             if idx[0] == "unique":
                 op.create_unique_constraint(idx[1], tbl_def[0], idx[2])
