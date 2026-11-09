@@ -20,12 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 async def run_seed() -> None:
     from decimal import Decimal
     from sqlalchemy import select
-    from src.infrastructure.db.session import get_session, get_engine
-    from src.infrastructure.db.models import PlanModel, MetaModel, Base
-
-    engine = get_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    from src.infrastructure.db.session import get_session
+    from src.infrastructure.db.models import PlanModel, MetaModel
 
     DEFAULT_PLANS = [
         dict(name="رایگان", name_en="Free", days=0, daily_posts=3, max_sources=2,
