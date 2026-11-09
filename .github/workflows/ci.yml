@@ -75,7 +75,24 @@ jobs:
           TELEGRAM_BOT_TOKEN: "0:test_token"
           ENCRYPTION_KEY: "test-encryption-key-32-chars-min-xx"
           SUPER_ADMIN_IDS: "123456789"
-        run: python -m src.runtime.migrate
+        run: |
+          python -m src.runtime.migrate
+          python - <<'PY'
+          from sqlalchemy import create_engine, inspect
+          from config.settings import get_settings
+          from src.infrastructure.db.models import Base
+
+          engine = create_engine(get_settings().sync_database_url)
+          try:
+              actual = set(inspect(engine).get_table_names())
+              expected = set(Base.metadata.tables)
+              missing = sorted(expected - actual)
+              if missing:
+                  raise SystemExit(f"PostgreSQL migration missed tables: {missing}")
+              print(f"PostgreSQL schema verified: all {len(expected)} ORM tables exist.")
+          finally:
+              engine.dispose()
+          PY
 
       - name: Check for secrets in code
         run: |
