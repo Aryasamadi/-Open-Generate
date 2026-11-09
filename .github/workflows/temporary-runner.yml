@@ -201,6 +201,7 @@ jobs:
         run: |
           set -euo pipefail
           docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner run --rm migrate
+          echo "DATABASE_INITIALIZED=true" >> "$GITHUB_ENV"
           docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner up -d bot worker
           for attempt in $(seq 1 36); do
             if curl -fsS http://127.0.0.1:9090/health | grep -q '"status": "ok"'; then
@@ -245,9 +246,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f .env.secret ]] && docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner ps --services --status running | grep -Fxq db; then
+          if [[ "${DATABASE_INITIALIZED:-}" == "true" ]] && [[ -f .env.secret ]] && docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner ps --services --status running | grep -Fxq db; then
             bash "$RUNNER_TEMP/open-generate-state.sh" save
             docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner down --remove-orphans || true
           else
-            echo "Database container was not initialized; no final snapshot required."
+            echo "Migration/seed did not complete; preserving the previous database snapshot."
           fi
