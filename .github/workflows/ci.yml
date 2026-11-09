@@ -63,6 +63,20 @@ jobs:
       - name: Run tests
         run: pytest tests/unit tests/security -v --tb=short
 
+      - name: PostgreSQL migration smoke test
+        env:
+          APP_ENV: production
+          DB_DRIVER: postgresql+asyncpg
+          DB_HOST: 127.0.0.1
+          DB_PORT: "5432"
+          DB_NAME: og_test
+          DB_USER: og_test
+          DB_PASSWORD: og_test_pass
+          TELEGRAM_BOT_TOKEN: "0:test_token"
+          ENCRYPTION_KEY: "test-encryption-key-32-chars-min-xx"
+          SUPER_ADMIN_IDS: "123456789"
+        run: python -m src.runtime.migrate
+
       - name: Check for secrets in code
         run: |
           if grep -r "sk-\|AKIA\|password.*=.*['\"][^$]" src/ --include="*.py" | grep -v "test\|example\|placeholder"; then
