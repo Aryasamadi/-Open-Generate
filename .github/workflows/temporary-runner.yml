@@ -45,6 +45,7 @@ jobs:
             echo "::error::Admin ID must be numeric (multiple IDs may be comma-separated)."
             exit 1
           fi
+          # Keep the Telegram token stable: it also anchors the persistent database encryption key.
           KEY="$(python3 - <<'PY'
           import hashlib, hmac, os
           token = os.environ["TELEGRAM_BOT_TOKEN"].encode()
@@ -237,7 +238,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f .env.secret ]] && docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner ps -q db | grep -q .; then
+          if [[ -f .env.secret ]] && docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner ps --services --status running | grep -Fxq db; then
             bash "$RUNNER_TEMP/open-generate-state.sh" save
             docker compose --env-file .env.secret -f docker-compose.yml -p open-generate-runner down --remove-orphans || true
           else
